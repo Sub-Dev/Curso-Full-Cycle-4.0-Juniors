@@ -1,6 +1,7 @@
 {
   "name": "curso-oo",
   "version": "1.0.0",
+  "type": "module",
   "description": "",
   "main": "index.js",
   "scripts": {
@@ -11,6 +12,7 @@
   "author": "",
   "license": "ISC",
   "devDependencies": {
+    "tsx": "^4.20.6",
     "typescript": "^5.9.3"
   }
 }
