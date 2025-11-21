@@ -1,4 +1,4 @@
-import { IUserRepository } from "../../domain/repository/IUserRepository.js";
+import type { IUserRepository } from "../../domain/repository/IUserRepository.js";
 import { User } from "../../domain/entity/User.js";
 import { EditUserDTO } from "../dtos/EditUserDTO.js";
 

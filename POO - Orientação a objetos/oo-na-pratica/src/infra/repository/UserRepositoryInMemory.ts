@@ -1,5 +1,5 @@
-import { IUserRepository } from "../../domain/repository/IUserRepository.js";
-import { User } from "../../domain/entity/User";
+import type { IUserRepository } from "../../domain/repository/IUserRepository.js";
+import { User } from "../../domain/entity/User.js";
 
 
 export class UserRepositoryInMemory implements IUserRepository {
