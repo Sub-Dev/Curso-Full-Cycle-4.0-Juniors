@@ -1,0 +1,21 @@
+{
+  "name": "isp-dip",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "inversify": "^6.2.2",
+    "reflect-metadata": "^0.2.2"
+  },
+  "devDependencies": {
+    "@types/reflect-metadata": "^0.1.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  }
+}
