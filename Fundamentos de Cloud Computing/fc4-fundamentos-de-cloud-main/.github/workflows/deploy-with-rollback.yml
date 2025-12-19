@@ -1,0 +1,98 @@
+name: Deploy to EC2 (with Rollback)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Build and Deploy with Rollback
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      
+      - name: Run tests
+        run: |
+          go mod download
+          go test ./... -v
+      
+      - name: Build binary
+        run: |
+          GOOS=linux GOARCH=amd64 go build -o finance-tracker ./cmd/api
+      
+      - name: Deploy to EC2 with Health Check
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          echo "$EC2_SSH_KEY" > deploy_key.pem
+          chmod 600 deploy_key.pem
+          
+          # Upload binário
+          scp -i deploy_key.pem -o StrictHostKeyChecking=no \
+            finance-tracker ${EC2_USER}@${EC2_HOST}:/tmp/finance-tracker-new
+          
+          # Deploy com rollback automático
+          ssh -i deploy_key.pem -o StrictHostKeyChecking=no \
+            ${EC2_USER}@${EC2_HOST} << 'ENDSSH'
+            set -e  # Exit on error
+            
+            echo "🔄 Parando serviço..."
+            sudo systemctl stop finance-tracker
+            
+            echo "💾 Fazendo backup do binário atual..."
+            if [ -f /opt/finance-tracker/finance-tracker ]; then
+              sudo cp /opt/finance-tracker/finance-tracker /opt/finance-tracker/finance-tracker.backup
+            fi
+            
+            echo "📦 Instalando nova versão..."
+            sudo mv /tmp/finance-tracker-new /opt/finance-tracker/finance-tracker
+            sudo chmod +x /opt/finance-tracker/finance-tracker
+            sudo chown ec2-user:ec2-user /opt/finance-tracker/finance-tracker
+            
+            echo "🚀 Iniciando serviço..."
+            sudo systemctl start finance-tracker
+            
+            echo "⏳ Aguardando aplicação iniciar..."
+            sleep 3
+            
+            echo "🏥 Health check..."
+            if curl -f http://localhost:8080/health; then
+              echo "✅ Deploy bem-sucedido!"
+              # Remover backup
+              sudo rm -f /opt/finance-tracker/finance-tracker.backup
+              exit 0
+            else
+              echo "❌ Health check falhou! Fazendo rollback..."
+              sudo systemctl stop finance-tracker
+              
+              if [ -f /opt/finance-tracker/finance-tracker.backup ]; then
+                sudo mv /opt/finance-tracker/finance-tracker.backup /opt/finance-tracker/finance-tracker
+                sudo systemctl start finance-tracker
+                echo "🔙 Rollback concluído. Versão anterior restaurada."
+              fi
+              
+              exit 1
+            fi
+          ENDSSH
+          
+          rm -f deploy_key.pem
+      
+      - name: Send notification (optional)
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ Deploy realizado com sucesso em $(date)"
+          else
+            echo "❌ Deploy falhou em $(date)"
+          fi

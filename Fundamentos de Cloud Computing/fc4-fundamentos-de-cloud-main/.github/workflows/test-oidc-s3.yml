@@ -1,0 +1,91 @@
+name: Test OIDC - Upload to S3
+
+on:
+  workflow_dispatch:  # Executar manualmente
+  push:
+    branches:
+      - test-oidc  # Ou crie uma branch de teste
+
+permissions:
+  id-token: write   # OBRIGATÓRIO para OIDC
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: finance-tracker-releases  # Altere se necessário
+
+jobs:
+  test-s3-upload:
+    name: Test S3 Upload with OIDC
+    runs-on: ubuntu-latest
+    
+    steps:
+      # 1. Checkout do código
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # 2. Configurar AWS credentials via OIDC
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      # 3. Verificar se autenticou corretamente
+      - name: Verify AWS Identity
+        run: |
+          echo "🔐 Verificando identidade AWS..."
+          aws sts get-caller-identity
+      
+      # 4. Criar arquivo de teste
+      - name: Create test file
+        run: |
+          echo "Hello from GitHub Actions!" > test-file.txt
+          echo "Timestamp: $(date)" >> test-file.txt
+          echo "Commit: ${{ github.sha }}" >> test-file.txt
+          echo "Actor: ${{ github.actor }}" >> test-file.txt
+          
+          cat test-file.txt
+      
+      # 5. Upload para S3
+      - name: Upload to S3
+        run: |
+          echo "📤 Enviando arquivo para S3..."
+          
+          aws s3 cp test-file.txt \
+            s3://${{ env.S3_BUCKET }}/test/test-file-${{ github.sha }}.txt \
+            --region ${{ env.AWS_REGION }}
+          
+          echo "✅ Arquivo enviado com sucesso!"
+      
+      # 6. Verificar se o arquivo existe no S3
+      - name: Verify file in S3
+        run: |
+          echo "🔍 Verificando arquivo no S3..."
+          
+          aws s3 ls s3://${{ env.S3_BUCKET }}/test/ --recursive
+      
+      # 7. Download do arquivo (teste de leitura)
+      - name: Download from S3
+        run: |
+          echo "📥 Baixando arquivo do S3..."
+          
+          aws s3 cp \
+            s3://${{ env.S3_BUCKET }}/test/test-file-${{ github.sha }}.txt \
+            downloaded-file.txt
+          
+          echo "📄 Conteúdo do arquivo baixado:"
+          cat downloaded-file.txt
+      
+      # 8. Teste completo!
+      - name: Success message
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ TESTE DE OIDC CONCLUÍDO COM SUCESSO!"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔐 Autenticação OIDC: OK"
+          echo "📤 Upload para S3: OK"
+          echo "📥 Download do S3: OK"
+          echo "🎯 Bucket: ${{ env.S3_BUCKET }}"
+          echo "🌍 Region: ${{ env.AWS_REGION }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
