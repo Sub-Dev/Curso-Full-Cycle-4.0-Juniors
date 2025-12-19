@@ -1,0 +1,215 @@
+name: Deploy to Auto Scaling Group
+
+on:
+  push:
+    branches:
+      - feature/configuracao
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # Necessário para OIDC
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: finance-tracker-releases  # Criar este bucket
+  APP_NAME: finance-tracker
+  ASG_NAME: finance-tracker-asg
+  LAUNCH_TEMPLATE_NAME: finance-tracker-launch-template
+
+jobs:
+  deploy:
+    name: Build and Deploy to ASG
+    runs-on: ubuntu-latest
+    
+    steps:
+      # 1. Checkout do código
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # 2. Configurar AWS credentials via OIDC
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      # 3. Setup Go
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.3'
+      
+      # 4. Executar testes
+      - name: Run tests
+        run: |
+          go mod download
+          go test ./... -v
+      
+      # 5. Build do binário para Linux AMD64
+      - name: Build binary
+        run: |
+          GOOS=linux GOARCH=amd64 go build -o finance-tracker ./cmd/api
+      
+      # 6. Gerar versão única (hash do commit)
+      - name: Generate version
+        id: version
+        run: |
+          VERSION="${GITHUB_SHA:0:7}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "📦 Version: $VERSION"
+      
+      # 7. Upload binário para S3
+      - name: Upload binary to S3
+        run: |
+          aws s3 cp finance-tracker \
+            s3://${{ env.S3_BUCKET }}/releases/${{ steps.version.outputs.version }}/finance-tracker \
+            --region ${{ env.AWS_REGION }}
+          
+          echo "✅ Binário enviado para S3"
+      
+      # 8. Preparar User Data Script
+      - name: Prepare User Data
+        run: |
+          # Substituir placeholders no user-data.sh
+          sed -i "s|BUCKET_NAME|${{ env.S3_BUCKET }}|g" infra/user-data.sh
+          sed -i "s|APP_VERSION|${{ steps.version.outputs.version }}|g" infra/user-data.sh
+          sed -i "s|DATABASE_URL_PLACEHOLDER|${{ secrets.DATABASE_URL }}|g" infra/user-data.sh
+          
+          # Codificar em base64
+          USER_DATA=$(cat infra/user-data.sh | base64 -w 0)
+          echo "USER_DATA=$USER_DATA" >> $GITHUB_ENV
+      
+      # 9. Criar nova versão do Launch Template
+      - name: Create Launch Template version
+        id: lt_version
+        run: |
+          NEW_VERSION=$(aws ec2 create-launch-template-version \
+            --launch-template-name ${{ env.LAUNCH_TEMPLATE_NAME }} \
+            --source-version '$Latest' \
+            --launch-template-data "{
+              \"UserData\": \"$USER_DATA\",
+              \"TagSpecifications\": [{
+                \"ResourceType\": \"instance\",
+                \"Tags\": [
+                  {\"Key\": \"Name\", \"Value\": \"finance-tracker-${{ steps.version.outputs.version }}\"},
+                  {\"Key\": \"Version\", \"Value\": \"${{ steps.version.outputs.version }}\"},
+                  {\"Key\": \"DeployedBy\", \"Value\": \"GitHub-Actions\"},
+                  {\"Key\": \"CommitSHA\", \"Value\": \"${{ github.sha }}\"}
+                ]
+              }]
+            }" \
+            --query 'LaunchTemplateVersion.VersionNumber' \
+            --output text)
+          
+          echo "lt_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "🚀 Launch Template versão $NEW_VERSION criada"
+      
+      # 10. Atualizar Auto Scaling Group
+      - name: Update Auto Scaling Group
+        run: |
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name ${{ env.ASG_NAME }} \
+            --launch-template "LaunchTemplateName=${{ env.LAUNCH_TEMPLATE_NAME }},Version=${{ steps.lt_version.outputs.lt_version }}"
+          
+          echo "✅ Auto Scaling Group atualizado"
+      
+      # 11. Iniciar Instance Refresh (Rolling Update)
+      - name: Start Instance Refresh
+        id: refresh
+        run: |
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name ${{ env.ASG_NAME }} \
+            --preferences '{
+              "MinHealthyPercentage": 50,
+              "InstanceWarmup": 60,
+              "CheckpointPercentages": [50, 100],
+              "CheckpointDelay": 30
+            }' \
+            --query 'InstanceRefreshId' \
+            --output text)
+          
+          echo "refresh_id=$REFRESH_ID" >> $GITHUB_OUTPUT
+          echo "🔄 Instance Refresh iniciado: $REFRESH_ID"
+      
+      # 12. Aguardar conclusão do Instance Refresh
+      - name: Wait for Instance Refresh
+        run: |
+          echo "⏳ Aguardando Instance Refresh concluir..."
+          
+          while true; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name ${{ env.ASG_NAME }} \
+              --instance-refresh-ids ${{ steps.refresh.outputs.refresh_id }} \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text)
+            
+            echo "Status atual: $STATUS"
+            
+            if [ "$STATUS" == "Successful" ]; then
+              echo "✅ Instance Refresh concluído com sucesso!"
+              break
+            elif [ "$STATUS" == "Failed" ] || [ "$STATUS" == "Cancelled" ]; then
+              echo "❌ Instance Refresh falhou!"
+              exit 1
+            fi
+            
+            sleep 30
+          done
+      
+      # 13. Verificar saúde do Target Group
+      - name: Check Target Group Health
+        run: |
+          TARGET_GROUP_ARN=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names ${{ env.ASG_NAME }} \
+            --query 'AutoScalingGroups[0].TargetGroupARNs[0]' \
+            --output text)
+          
+          echo "🏥 Verificando saúde do Target Group..."
+          
+          HEALTHY_COUNT=$(aws elbv2 describe-target-health \
+            --target-group-arn $TARGET_GROUP_ARN \
+            --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
+            --output text)
+          
+          echo "✅ Instâncias saudáveis: $HEALTHY_COUNT"
+          
+          if [ "$HEALTHY_COUNT" -lt 1 ]; then
+            echo "❌ Nenhuma instância saudável encontrada!"
+            exit 1
+          fi
+      
+      # 14. Notificação de sucesso
+      - name: Deployment Summary
+        if: success()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ DEPLOY CONCLUÍDO COM SUCESSO!"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📦 Versão: ${{ steps.version.outputs.version }}"
+          echo "🚀 Launch Template: v${{ steps.lt_version.outputs.lt_version }}"
+          echo "🔄 Instance Refresh: ${{ steps.refresh.outputs.refresh_id }}"
+          echo "⏰ Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo "👤 Deployed by: ${{ github.actor }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      
+      # 15. Rollback em caso de falha
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "❌ Deploy falhou! Iniciando rollback..."
+          
+          # Cancelar instance refresh
+          aws autoscaling cancel-instance-refresh \
+            --auto-scaling-group-name ${{ env.ASG_NAME }} || true
+          
+          # Voltar para versão anterior do Launch Template
+          PREVIOUS_VERSION=$(( ${{ steps.lt_version.outputs.lt_version }} - 1 ))
+          
+          if [ "$PREVIOUS_VERSION" -gt 0 ]; then
+            aws ec2 modify-launch-template \
+              --launch-template-name ${{ env.LAUNCH_TEMPLATE_NAME }} \
+              --default-version $PREVIOUS_VERSION
+            
+            echo "🔙 Rollback para Launch Template v$PREVIOUS_VERSION"
+          fi
